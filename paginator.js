@@ -309,6 +309,7 @@ class View {
     columnize({ width, height, gap, columnWidth }) {
         const vertical = this.#vertical
         this.#size = vertical ? height : width
+        this.container.setRenderedSize(this.#size)
 
         const doc = this.document
         setStylesImportant(doc.documentElement, {
@@ -449,6 +450,7 @@ export class Paginator extends HTMLElement {
     #touchState
     #touchScrolled
     #lastVisibleRange
+    #renderedSize // page size recorded by columnize(); stable across any WebKit container-growth
     constructor() {
         super()
         this.#root.innerHTML = `<style>
@@ -507,6 +509,14 @@ export class Paginator extends HTMLElement {
             grid-column: 2 / 5;
             grid-row: 2;
             overflow: hidden;
+            /* Prevent WebKit from expanding the grid item beyond the grid's
+               allocated size when the child element has a large explicit width.
+               min-width/height suppresses auto minimum-size growth; max-width/height
+               hard-caps the element at #top's size regardless of child overflow. */
+            min-width: 0;
+            min-height: 0;
+            max-width: 100%;
+            max-height: 100%;
         }
         :host([flow="scrolled"]) #container {
             grid-column: 1 / -1;
@@ -684,7 +694,13 @@ export class Paginator extends HTMLElement {
         // this is needed because the iframe does not fill the whole element
         this.#background.style.background = background
 
-        const { width, height } = this.#container.getBoundingClientRect()
+        // Force a layout flush before reading container dimensions.
+        // On WKWebView, clientWidth can return a stale value when this runs
+        // inside the iframe load event; reading offsetWidth flushes pending work.
+        void this.#container.offsetWidth
+
+        const width = this.#container.clientWidth
+        const height = this.#container.clientHeight
         const size = vertical ? height : width
 
         const style = getComputedStyle(this.#top)
@@ -773,10 +789,17 @@ export class Paginator extends HTMLElement {
             : scrolled ? 'height' : 'width'
     }
     get size() {
-        return this.#container.getBoundingClientRect()[this.sideProp]
+        // In paginated mode, use the size recorded at render time (View.columnize).
+        // WebKit can grow #container after expand() sets a large element width, causing
+        // the live clientWidth to disagree with the column-width used for layout.
+        if (this.#renderedSize != null && !this.scrolled) return this.#renderedSize
+        return this.#vertical ? this.#container.clientHeight : this.#container.clientWidth
+    }
+    setRenderedSize(size) {
+        this.#renderedSize = size
     }
     get viewSize() {
-        return this.#view.element.getBoundingClientRect()[this.sideProp]
+        return this.#vertical ? this.#view.element.offsetHeight : this.#view.element.offsetWidth
     }
     get start() {
         return Math.abs(this.#container[this.scrollProp])
@@ -973,6 +996,11 @@ export class Paginator extends HTMLElement {
         this.#index = index
         const hasFocus = this.#view?.document?.hasFocus()
         if (src) {
+            // Reset anchor to a safe fraction before creating the new view so that
+            // every onExpand() call during the section load (from columnize, fonts.ready,
+            // or ResizeObserver after setStyles) uses 0 instead of a stale Range from the
+            // old section's destroyed document, which can produce wrong scroll positions.
+            this.#anchor = 0
             const view = this.#createView()
             const afterLoad = doc => {
                 if (doc.head) {
@@ -986,6 +1014,19 @@ export class Paginator extends HTMLElement {
             }
             const beforeRender = this.#beforeRender.bind(this)
             await view.load(src, afterLoad, beforeRender)
+
+            // After the iframe has fully loaded, the container may have grown
+            // beyond the size #beforeRender saw (a WKWebView layout quirk where
+            // reading clientWidth inside the iframe load event returns a stale
+            // value). If sizes disagree, re-render so column widths and scroll
+            // offsets are computed from the same settled container size.
+            if (!this.scrolled && this.#renderedSize != null) {
+                const liveSize = this.#vertical
+                    ? this.#container.clientHeight
+                    : this.#container.clientWidth
+                if (liveSize !== this.#renderedSize) this.render()
+            }
+
             this.dispatchEvent(new CustomEvent('create-overlayer', {
                 detail: {
                     doc: view.document, index,
